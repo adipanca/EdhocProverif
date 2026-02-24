@@ -1,0 +1,274 @@
+(* -------------------- Types & algebraic ops -------------------- *)
+type skey.          (* secret key type for KEM *)
+type spk.           (* public key type for KEM *)
+type exponent.      (* ECDH exponent (private) *)
+type G.             (* group element type (public) *)
+type key.
+
+(* Static long-term Responder *)
+free b: exponent [private].
+(* Static long-term Initiator *)
+free a: exponent [private].
+
+const TAG_LEN2: bitstring.
+const TAG_LEN3: bitstring.
+
+(* Public channel *)
+free c: channel.
+
+(* base generator *)
+const g: G.
+
+(* ECDH exponentiation: X = g^x *)
+fun exp(G, exponent): G.
+equation forall x: exponent, y: exponent;
+  exp(exp(g, x), y) = exp(exp(g, y), x).
+
+(* KEM public-key derivation from secret key (model KeyGen as new sk -> pk) *)
+fun pk(skey): spk. (* kem keygen *)
+fun kem_k(spk): key[private]. (* kem encap shared secret *)
+fun kem_ct(spk): key. (* kem encap chipertext *)
+fun kem_dec(skey, key): key (* kem decap secret key *)
+reduc forall sk: skey; kem_dec(sk, kem_ct(pk(sk))) = kem_k(pk(sk)).
+
+fun H(bitstring): bitstring.  (* hash *)
+fun KDF(bitstring): bitstring. (* key derivation function *)
+fun extract(bitstring, bitstring, bitstring): key.        (* Extract(ikm1, ikm2, salt/ctx) *)
+fun expands(key, bitstring): key.                         (* Expand(PRK, info) *)
+
+(* AEAD *)
+       (* aead_enc(key, associated_data, plain_text) *)
+fun aead_enc(key, bitstring, bitstring): bitstring.
+       (* aead_dec(key, associated_data, cipher_text) *)
+fun aead_dec(key, bitstring, bitstring): bitstring
+reduc forall k: key, p: bitstring, ad: bitstring;
+    aead_dec(k, ad, aead_enc(k, ad, p)) = p.
+
+(* Converter *)
+fun g2b(G): bitstring [data, typeConverter].
+fun k2b(key): bitstring [data, typeConverter].
+fun b2k(bitstring): key [data, typeConverter].
+
+
+(* Authentication queries *)
+event S_STEP1_I_to_R(bitstring, bitstring).
+event E_STEP1_I_to_R(bitstring, bitstring).
+event S_STEP2_R_to_I(key, bitstring).
+event E_STEP2_R_to_I(key, bitstring).
+event S_STEP3_I_to_R(key, bitstring).
+event E_STEP3_I_to_R(key, bitstring).
+
+
+query k: bitstring, msg: bitstring;
+       inj-event(E_STEP1_I_to_R(k, msg)) 
+       ==> inj-event(S_STEP1_I_to_R(k, msg)).
+
+query k: key, msg: bitstring;
+       inj-event(E_STEP2_R_to_I(k, msg)) 
+       ==> inj-event(S_STEP2_R_to_I(k, msg)).
+
+query k: key, msg: bitstring;
+       inj-event(E_STEP3_I_to_R(k, msg)) 
+       ==> inj-event(S_STEP3_I_to_R(k, msg)).
+
+(* -------------------- Processes -------------------- *)
+
+(* Secrecy assumptions *)
+free app_data1, app_data2, CI, CR, KKEM: bitstring [private].
+query attacker(CI).
+query attacker(CR).
+query attacker(KKEM).
+query attacker(app_data1).
+query attacker(app_data2).
+
+free c_debug, s_debug: bitstring [private].
+
+(* Debugger *)
+(* query attacker(s_debug). *)
+(* query attacker(c_debug). *)
+
+(* Initiator: *)
+let Initiator(skKEM:skey, PKKEM:spk) =
+    (* -------------------- Public constants (protocol fields) -------------------- *)
+    new Method: bitstring;
+    new CipherSuites: bitstring;
+    new CI: bitstring;    (* Client Identity (CI) or ephemeral identifier *)
+    new EAD1: bitstring;  (* Extension/Application Data 1 *)
+
+    new x: exponent;                       (* ephemeral ECDH private exponent *)
+    let X = exp(g, x) in                   (* ECDH public value *)
+    let A_pub = exp(g, a) in
+    let M1 = (Method, CipherSuites, X, PKKEM, CI, EAD1, A_pub) in
+    event S_STEP1_I_to_R(CI,M1);
+    out(c, M1);
+    
+
+    (* Terima M2 = (Y, CKEM, C2) *)
+    in(c, M2: bitstring);
+    let (Y: G, CKEM: key, C2: bitstring) = M2 in
+
+    (* 1. kKEM = KEM.Dec(skKEM, CKEM) *)
+    let kKEM = kem_dec(skKEM, CKEM) in
+
+    (* 2. TH2 = H(M1, Y, CKEM) *)
+    let TH2 = H(( (Method, CipherSuites, X, PKKEM, CI, EAD1, A_pub),
+                  g2b(Y), k2b(CKEM))) in
+    
+    (* 3. PRK2e = Extract(Y^x, kKEM, TH2); EK2 = Expand(PRK2e, TH2) *)
+    let Yx    = exp(Y, x) in
+    let prk2e = extract(g2b(Yx), k2b(kKEM), TH2) in
+    let EK2   = expands(prk2e, TH2) in
+
+    (* 4. msg2 = DecEK2(EncEK2(msg2)) -- di sini AEAD AAD = TH2 *)
+    let msg2  = aead_dec(EK2, TH2, C2) in
+
+    (* 5. Parse (CR, R, EAD2, MAC2) *)
+    let (CR: bitstring, R: bitstring, EAD2: bitstring, MAC2: bitstring) = msg2 in
+
+    (* 6. PRK3e2m = Extract(B^x, PRK2e); MK2 = Expand(PRK3e2m, TH2) *)
+    let B  = exp(g, b) in
+    let Bx = exp(B, x) in
+    let prk3e2m = extract(g2b(Bx), k2b(prk2e), TH2) in
+    let MK2     = expands(prk3e2m, TH2) in
+
+    (* 7. Verify MAC2 *)
+    let len2 = H((TAG_LEN2, TH2, EAD2)) in
+    let mac2_check = KDF((k2b(MK2), R, g2b(B), TH2, EAD2, len2)) in
+    if MAC2 = mac2_check then(
+      event E_STEP2_R_to_I(b2k(MAC2), msg2);
+
+      (* 8. TH3 = H(TH2, msg2, B) *)
+      let TH3 = H((TH2, msg2, g2b(B))) in
+
+      (* 9. (EK3, IV3) dari Expand(PRK3e2m, TH3).
+            Kita modelkan EK3 = expands(prk3e2m, TH3), dan IV3 turunan hash. *)
+      let EK3 = expands(prk3e2m, TH3) in
+      let IV3 = H((k2b(prk3e2m), TH3)) in   (* placeholder IV; tidak dipakai jika AEAD tak butuh IV eksplisit *)
+
+      (* 10. PRK4e3m = Extract(Y^a, PRK3e2m); MK3 = Expand(PRK4e3m, TH3) *)
+      let Ya      = exp(Y, a) in
+      let prk4e3m = extract(g2b(Ya), k2b(prk3e2m), TH3) in
+      let MK3     = expands(prk4e3m, TH3) in
+
+      (* 11. MAC3 = KDF(MK3, I, A, TH3, EAD3, len3) *)
+      new I: bitstring;                 (* Initiator identity *)
+      new EAD3: bitstring;
+      let len3 = H((TAG_LEN3, TH3, EAD3)) in
+      let MAC3 = KDF((k2b(MK3), I, g2b(A_pub), TH3, EAD3, len3)) in
+
+      (* 12. msg3 = (I, EAD3, MAC3) *)
+      let msg3 = (I, EAD3, MAC3) in
+
+      (* 13. M3 = EncEK3(msg3) dengan AAD = TH3 *)
+      let M3 = aead_enc(EK3, TH3, msg3) in
+      event S_STEP3_I_to_R(b2k(MAC3), M3);
+      out(c, M3);
+
+      (* 14. TH4 = H(TH3, msg3, A) *)
+      let TH4 = H((TH3, msg3, g2b(A_pub))) in
+
+      (* 15. PRKout = Expand(PRK4e3m, TH4); AK = Expand(PRKout) *)
+      let PRKout = expands(prk4e3m, TH4) in
+      (* Karena spesifikasi menulis Expand(Expand(PRKout)), kita sederhanakan:
+         AK = expands(PRKout, TH4). Jika mau persis, bisa tambahkan info konstan. *)
+      let AK = expands(PRKout, TH4) in
+
+      let e_app_data2 = aead_enc(AK, TH4, app_data2) in
+      out(c, c_debug);
+      out(c, e_app_data2);
+      
+      0
+    )else
+      (* verifikasi MAC2 gagal *)
+    0
+.
+
+(* Responder: only receives (in()) and stops *)
+let Responder =
+    in(c, M1:bitstring);
+    (* Terima M1 yang terstruktur: (Method, CipherSuites, X, PKKEM, CI, EAD1) *)
+    let (Method:bitstring, CipherSuites:bitstring, X:G, PKKEM:spk, CI:bitstring, EAD1:bitstring, A_pub:G) = M1 in
+    event E_STEP1_I_to_R(CI, M1);
+
+    (* 1. KEM.Enc(PKKEM) -> (kKEM, CKEM) *)
+    let kKEM  = kem_k(PKKEM) in
+    let CKEM  = kem_ct(PKKEM) in
+
+    (* 2. Ephemeral ECDH y,Y *)
+    new y: exponent;
+    let Y = exp(g, y) in
+
+    (* 3. TH2 = H(M1, Y, CKEM) *)
+    let TH2 = H(((Method, CipherSuites, X, PKKEM, CI, EAD1, A_pub), g2b(Y), k2b(CKEM))) in
+
+    (* 4. PRK2e = Extract(X^y, kKEM, TH2); EK2 = Expand(PRK2e, TH2) *)
+    let Xy  = exp(X, y) in
+    let prk2e = extract(g2b(Xy), k2b(kKEM), TH2) in
+    let EK2 = expands(prk2e, TH2) in
+
+    (* 5. PRK3e2m = Extract(X^b, PRK2e); MK2 = Expand(PRK3e2m, TH2) *)
+    let Xb  = exp(X, b) in
+    let prk3e2m = extract(g2b(Xb), k2b(prk2e), TH2) in
+    let MK2 = expands(prk3e2m, TH2) in
+
+    (* 6. MAC2 = KDF(MK2, R, B, TH2, EAD2, len2) *)
+    new EAD2:bitstring;
+    let len2 = H((TAG_LEN2, TH2, EAD2)) in         (* length encoding untuk MAC2/KDF *)
+    let B = exp(g, b) in
+    new R:bitstring;(* Responder identity *)
+    let MAC2 = KDF((k2b(MK2), R, g2b(B), TH2, EAD2, len2)) in
+
+    (* 7. msg2 = (CR, R, EAD2, MAC2) *)
+    new CR:bitstring;
+    let msg2 = (CR, R, EAD2, MAC2) in
+
+    (* 8. M2 = (Y, CKEM, Enc_EK2(msg2)) dan kirim *)
+    let M2 = (Y, CKEM, aead_enc(EK2, TH2, msg2)) in
+    event S_STEP2_R_to_I(b2k(MAC2), msg2);
+    out(c, M2);
+
+
+    (* ====== Upon receiving M3 from I ====== *)
+    in(c, M3: bitstring);                  (* M3 = aead_enc(EK3, TH3, msg3) *)
+
+    (* 1. TH3 = H(TH2, msg2, B) *)
+    let TH3 = H((TH2, msg2, g2b(B))) in
+
+    (* 2. (EK3, IV3) dari Expand(PRK3e2m, TH3) *)
+    let EK3 = expands(prk3e2m, TH3) in
+    let IV3 = H((k2b(prk3e2m), TH3)) in   (* placeholder jika ingin eksplisit IV *)
+
+    (* 3. msg3 = DecEK3(EncEK3(msg3)) dengan AAD = TH3 *)
+    let msg3 = aead_dec(EK3, TH3, M3) in
+
+    (* 4. Parse (I, EAD3, MAC3) *)
+    let (I: bitstring, EAD3: bitstring, MAC3: bitstring) = msg3 in
+
+    (* 5. PRK4e3m = Extract(A^y, PRK3e2m); MK3 = Expand(PRK4e3m, TH3) *)
+    let Ay      = exp(A_pub, y) in
+    let prk4e3m = extract(g2b(Ay), k2b(prk3e2m), TH3) in
+    let MK3     = expands(prk4e3m, TH3) in
+
+    (* 6. Verify MAC3 *)
+    let len3 = H((TAG_LEN3, TH3, EAD3)) in
+    let mac3_check = KDF((k2b(MK3), I, g2b(A_pub), TH3, EAD3, len3)) in
+    if MAC3 = mac3_check then
+        event E_STEP3_I_to_R(b2k(MAC3), M3);
+        (* 7. TH4 = H(TH3, msg3, A) *)
+        let TH4 = H((TH3, msg3, g2b(A_pub))) in
+        (* 8. PRKout & AK *)
+        let PRKout = expands(prk4e3m, TH4) in
+        let AK = expands(PRKout, TH4) in
+
+        let e_app_data1 = aead_enc(AK, TH4, app_data1) in
+        out(c, s_debug);
+        out(c, e_app_data1);
+        0
+    else
+        0.
+
+(* Composition: one initiator and one responder *)
+process
+    new skKEM: skey;                       (* ephemeral KEM secret key *)
+    let PKKEM = pk(skKEM) in               (* corresponding public key *)
+    ( (!Initiator(skKEM, PKKEM)) | (!Responder) | ( phase 1; out(c, (skKEM)) (* Security requirement : Forward Secrecy *) ))
