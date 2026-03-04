@@ -5,10 +5,8 @@ type exponent.      (* ECDH exponent (private) *)
 type G.             (* group element type (public) *)
 type key.
 
-(* Static long-term Responder *)
-free b: exponent [private].
-(* Static long-term Initiator *)
-free a: exponent [private].
+(* Long-term keys a (Initiator) and b (Responder) are generated
+   as 'new' inside the main process — see bottom of file. *)
 
 const TAG_LEN2: bitstring.
 const TAG_LEN3: bitstring.
@@ -88,7 +86,7 @@ free c_debug, s_debug: bitstring [private].
 (* query attacker(c_debug). *)
 
 (* Initiator: *)
-let Initiator(skKEM:skey, PKKEM:spk) =
+let Initiator(a: exponent, B_pub: G, skKEM:skey, PKKEM:spk) =
     (* -------------------- Public constants (protocol fields) -------------------- *)
     new Method: bitstring;
     new CipherSuites: bitstring;
@@ -126,19 +124,18 @@ let Initiator(skKEM:skey, PKKEM:spk) =
     let (CR: bitstring, R: bitstring, EAD2: bitstring, MAC2: bitstring) = msg2 in
 
     (* 6. PRK3e2m = Extract(B^x, PRK2e); MK2 = Expand(PRK3e2m, TH2) *)
-    let B  = exp(g, b) in
-    let Bx = exp(B, x) in
+    let Bx = exp(B_pub, x) in
     let prk3e2m = extract(g2b(Bx), k2b(prk2e), TH2) in
     let MK2     = expands(prk3e2m, TH2) in
 
     (* 7. Verify MAC2 *)
     let len2 = H((TAG_LEN2, TH2, EAD2)) in
-    let mac2_check = KDF((k2b(MK2), R, g2b(B), TH2, EAD2, len2)) in
+    let mac2_check = KDF((k2b(MK2), R, g2b(B_pub), TH2, EAD2, len2)) in
     if MAC2 = mac2_check then(
       event E_STEP2_R_to_I(b2k(MAC2), msg2);
 
       (* 8. TH3 = H(TH2, msg2, B) *)
-      let TH3 = H((TH2, msg2, g2b(B))) in
+      let TH3 = H((TH2, msg2, g2b(B_pub))) in
 
       (* 9. (EK3, IV3) dari Expand(PRK3e2m, TH3).
             Kita modelkan EK3 = expands(prk3e2m, TH3), dan IV3 turunan hash. *)
@@ -184,7 +181,7 @@ let Initiator(skKEM:skey, PKKEM:spk) =
 .
 
 (* Responder: only receives (in()) and stops *)
-let Responder =
+let Responder(b: exponent) =
     in(c, M1:bitstring);
     (* Terima M1 yang terstruktur: (Method, CipherSuites, X, PKKEM, CI, EAD1) *)
     let (Method:bitstring, CipherSuites:bitstring, X:G, PKKEM:spk, CI:bitstring, EAD1:bitstring, A_pub:G) = M1 in
@@ -269,6 +266,9 @@ let Responder =
 
 (* Composition: one initiator and one responder *)
 process
+    new a: exponent;                       (* long-term Initiator private key *)
+    new b: exponent;                       (* long-term Responder private key *)
+    let B_pub = exp(g, b) in              (* Responder static public key *)
     new skKEM: skey;                       (* ephemeral KEM secret key *)
     let PKKEM = pk(skKEM) in               (* corresponding public key *)
-    ( (!Initiator(skKEM, PKKEM)) | (!Responder) | ( phase 1; out(c, (skKEM)) (* Security requirement : Forward Secrecy *) ))
+    ( (!Initiator(a, B_pub, skKEM, PKKEM)) | (!Responder(b)) | ( phase 1; out(c, (skKEM)) (* Security requirement : Forward Secrecy *) ))
