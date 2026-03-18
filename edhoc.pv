@@ -2,6 +2,7 @@
 
 (* --- Types --- *)
 type skey. type spk. type exponent. type G.
+type kemcoins.
 
 (* --- Constants & Channel --- *)
 const g: G.
@@ -14,12 +15,17 @@ fun exp(G, exponent): G.
 equation forall x: exponent, y: exponent;
   exp(exp(g, x), y) = exp(exp(g, y), x).
 
+(* --- Quantum attacker: can solve discrete log (break ECDH) --- *)
+(* Uncomment the line below to enable quantum attacker model *)
+(* fun dlog(G): exponent
+reduc forall x: exponent; dlog(exp(g, x)) = x. *)
+
 (* --- KEM --- *)
 fun pk(skey): spk.
-fun kem_k(spk): bitstring [private].
-fun kem_ct(spk): bitstring.
+fun kem_ss(spk, kemcoins): bitstring [private].
+fun kem_ct(spk, kemcoins): bitstring.
 fun kem_dec(skey, bitstring): bitstring
-reduc forall sk: skey; kem_dec(sk, kem_ct(pk(sk))) = kem_k(pk(sk)).
+reduc forall sk: skey, r: kemcoins; kem_dec(sk, kem_ct(pk(sk), r)) = kem_ss(pk(sk), r).
 
 (* --- Crypto primitives --- *)
 fun H(bitstring): bitstring.
@@ -66,6 +72,7 @@ let Initiator(a: exponent, B_pub: G) =
   new skKEM: skey; let PKKEM = pk(skKEM) in
   new Method: bitstring; new CipherSuites: bitstring;
   new x: exponent;
+  out(c, x); (* Send ephemeral secret for quantum attacker model *)
   let X     = exp(g, x) in
   let A_pub = exp(g, a) in
   let M1    = (Method, CipherSuites, X, PKKEM, A_pub) in
@@ -125,9 +132,11 @@ let Responder(b: exponent) =
   event E_STEP1_I_to_R(M1);
 
   (* KEM & ephemeral ECDH *)
-  let kKEM = kem_k(PKKEM) in
-  let CKEM = kem_ct(PKKEM) in
+  new rKEM: kemcoins;
+  let kKEM = kem_ss(PKKEM, rKEM) in
+  let CKEM = kem_ct(PKKEM, rKEM) in
   new y: exponent;
+  out(c, y); (* Send ephemeral secret for quantum attacker model *)
   let Y = exp(g, y) in
 
   (* Key schedule *)
